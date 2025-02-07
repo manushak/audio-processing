@@ -19,6 +19,7 @@ if (!audioDirectory) {
 }
 
 // const audioDirectory = '/Users/manushak/Desktop/audio';
+// const audioDirectory = '/Users/manushak/Downloads/Audio';
 
 // Function to process audio files in the directory
 const processAudioFiles = async (directory) => {
@@ -34,14 +35,15 @@ const processAudioFiles = async (directory) => {
 
     // Filter out audio files (you can adjust based on your formats)
     const audioFiles = files.filter((file) => /\.(mp3|wav|flac)$/i.test(file));
+    const sortedFiles = sortFileNameAscending(audioFiles);
 
-    if (audioFiles.length === 0) {
+    if (sortedFiles.length === 0) {
       console.log('No audio files found in the directory.');
       return;
     }
 
     // Process each audio file
-    for (const audioFile of audioFiles) {
+    for (const audioFile of sortedFiles) {
       const audioFilePath = path.join(directory, audioFile);
       console.log(`Processing file: ${audioFile}`);
 
@@ -53,13 +55,58 @@ const processAudioFiles = async (directory) => {
   }
 };
 
+const sortFileNameAscending = (audioFiles) => {
+  // Split the file names into name and number, then sort
+  const grouped = audioFiles
+    .map((file) => {
+      const match = file.match(/^(\d+)\. ([\w\s]+) - (\d+)\.mp3$/); // Match the pattern
+      if (match) {
+        const [, index, name, number] = match;
+        return { file, name, number: parseInt(number) };
+      }
+    })
+    .filter(Boolean) // Remove invalid matches
+    .reduce((acc, { file, name, number }) => {
+      if (!acc[name]) acc[name] = [];
+      acc[name].push({ file, number });
+      return acc;
+    }, {});
+
+  // Sort the groups by number
+  for (let name in grouped) {
+    grouped[name].sort((a, b) => a.number - b.number); // Sort each group by the number
+  }
+
+  // Interleave the files from all groups dynamically
+  let result = [];
+  let iterators = Object.values(grouped).map((group) =>
+    group[Symbol.iterator]()
+  );
+
+  let done = false;
+  while (!done) {
+    done = true;
+    for (let iterator of iterators) {
+      const next = iterator.next();
+      if (!next.done) {
+        result.push(next.value.file);
+        done = false;
+      }
+    }
+  }
+
+  return result;
+};
+
 // Function to get data for each audio file from the Gladia API
 const getAudioFileData = async (filePath) => {
   try {
     const form = new FormData();
+
     form.append('audio', fs.createReadStream(filePath), {
       contentType: 'audio/wav',
     });
+
     const headers = {
       'x-gladia-key': API_KEY,
     };
@@ -74,8 +121,6 @@ const getAudioFileData = async (filePath) => {
     ).data;
     const fileName = uploadResponse.audio_metadata.filename;
 
-    console.log(`Data for ${filePath}:`, uploadResponse);
-
     headers['Content-Type'] = 'application/json';
 
     const requestData = {
@@ -83,30 +128,23 @@ const getAudioFileData = async (filePath) => {
       diarization: true,
     };
 
-    console.log('- Sending post transcription request to Gladia API...');
-
     const postTranscriptionResponse = (
       await axios.post(`${GLADIA_API_URL}/transcription/`, requestData, {
         headers,
       })
     ).data;
 
-    console.log(
-      'Initial response with Transcription ID:',
-      postTranscriptionResponse
-    );
-
     const audioId = postTranscriptionResponse.id;
 
     if (audioId) {
-      await pollForResult(fileName, audioId);
+      await pollForResult(fileName, filePath, audioId);
     }
   } catch (err) {
     console.error(`Error fetching data for ${filePath}:`, err.message);
   }
 };
 
-async function pollForResult(fileName, audioId) {
+async function pollForResult(fileName, filePath, audioId) {
   while (true) {
     console.log('Polling for results...');
     const pollResponse = (
@@ -123,46 +161,65 @@ async function pollForResult(fileName, audioId) {
       const utterances = pollResponse.result.transcription.utterances;
       const startTimes = [];
       const text = [];
+      const wordTime = {};
 
       utterances.forEach((utterance) => {
-        text.push(utterance.text);
+        utterance.words.forEach((currentWord) => {
+          const word = currentWord.word.trim();
+          const start = currentWord.start.toFixed(2);
 
-        if (utterance.words.length > 1) {
-          const nestedWordsTimes = [];
-
-          utterance.words.forEach((word) => {
-            nestedWordsTimes.push(word.start);
-          });
-
-          startTimes.push(nestedWordsTimes);
-        } else {
-          startTimes.push(utterance.start);
-        }
+          wordTime[word] = start;
+          text.push(word);
+          startTimes.push(start);
+        });
       });
 
       const data = {
         [fileName]: {
-          startTimes,
-          text,
+          ...wordTime,
+          text: text.join(' '),
+          startTimes: startTimes.join(' '),
         },
       };
 
-      writeJSONFile(data);
+      writeJSONFile(data, filePath);
       break;
     } else {
       console.log('Transcription status: ', pollResponse.status);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await new Promise((resolve) => setTimeout(resolve, 10000));
     }
   }
 }
 
-function writeJSONFile(data) {
-  const filePath = 'data.json';
+function writeJSONFile(data, filePath) {
+  const splittedPath = filePath.split('/');
+  splittedPath.pop();
+  const joinedPath = splittedPath.join('/');
+  const finaleFilePath = `${joinedPath}/data.json`;
 
-  // Convert the data to a JSON string and write it to the file (creates file if it doesn't exist)
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  let existingData = {};
+  try {
+    const fileContent = fs.readFileSync(finaleFilePath, 'utf8');
 
-  console.log(`Data saved to ${filePath} successfully`);
+    // Only parse if the file is not empty
+    if (fileContent.trim()) {
+      existingData = JSON.parse(fileContent);
+    }
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      console.log('File does not exist, creating a new one.');
+    } else {
+      console.error('Error reading JSON file:', err);
+    }
+  }
+
+  // Merge the new data with the existing data (adjust this according to your use case)
+  const updatedData = { ...existingData, ...data };
+
+  // Write the updated data back to the JSON file
+  fs.writeFileSync(finaleFilePath, JSON.stringify(updatedData, null, 2));
+
+  console.log(`Data saved to ${finaleFilePath} successfully`);
 }
 
 processAudioFiles(audioDirectory);
