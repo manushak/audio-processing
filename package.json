@@ -1,7 +1,7 @@
 {
   "name": "audio-processing",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "script.js",
   "scripts": {},
   "type": "module",
   "author": "",
